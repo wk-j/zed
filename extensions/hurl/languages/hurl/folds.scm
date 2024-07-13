@@ -16,5 +16,3 @@
 (basic_auth_section) @fold
 (json_object) @fold
 (json_array) @fold
-(xml) @fold
-(multiline_string) @fold

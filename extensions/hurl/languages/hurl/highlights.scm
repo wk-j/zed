@@ -95,7 +95,7 @@
 ">=" @operator
 "lessThan" @keyword.operator
 "<" @operator
-"lessThanOrEquals" @operator
+"lessThanOrEquals" @keyword.operator
 "<=" @operator
 "startsWith" @keyword.operator
 "endsWith" @keyword.operator
@@ -127,34 +127,3 @@
 "base64," @string.special
 "file," @string.special
 "hex," @string.special
-
-; Additional highlighting for XML
-(xml_prolog) @keyword
-(xml_open_tag) @tag
-(xml_close_tag) @tag
-(xml_attribute) @attribute
-(xml_attribute_value) @string
-
-; Improved multiline string highlighting
-(multiline_string_type) @keyword
-(multiline_string_content) @string
-
-; HTTP status codes
-(status) @constant
-
-; Improved JSON highlighting
-(json_object_pair
-  key: (json_string) @property)
-(json_array) @punctuation.bracket
-
-; Highlight HTTP methods more prominently
-(method) @keyword.control
-
-; Highlight important Hurl keywords
-"GET" @keyword.control
-"POST" @keyword.control
-"PUT" @keyword.control
-"DELETE" @keyword.control
-"PATCH" @keyword.control
-"HEAD" @keyword.control
-"OPTIONS" @keyword.control
