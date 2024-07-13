@@ -13703,6 +13703,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zed-hurl"
+version = "0.2.0"
+dependencies = [
+ "zed_extension_api 0.0.4",
+]
+
+[[package]]
 name = "zed_actions"
 version = "0.1.0"
 dependencies = [
