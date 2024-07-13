@@ -54,3 +54,21 @@
   body: (block) @body)
   (#set! tag csharp-async-main)
 )
+
+; C# Class (for building project)
+((class_declaration
+  name: (identifier) @class_name) @class
+  (#set! tag csharp-class)
+)
+
+; C# Record (for building project)
+((record_declaration
+  name: (identifier) @record_name) @record
+  (#set! tag csharp-class)
+)
+
+; C# Struct (for building project)
+((struct_declaration
+  name: (identifier) @struct_name) @struct
+  (#set! tag csharp-class)
+)

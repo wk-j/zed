@@ -3,7 +3,9 @@
         "label": "dotnet run",
         "command": "dotnet",
         "args": [
-            "run"
+            "run",
+            "--project",
+            "$ZED_DIRNAME"
         ],
         "tags": [
             "csharp-console-main",
@@ -34,6 +36,17 @@
             "csharp-console-main",
             "csharp-async-main",
             "csharp-test-method"
+        ]
+    },
+    {
+        "label": "dotnet build (from any class)",
+        "command": "dotnet",
+        "args": [
+            "build",
+            "$ZED_DIRNAME"
+        ],
+        "tags": [
+            "csharp-class"
         ]
     }
 ]
