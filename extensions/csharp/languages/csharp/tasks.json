@@ -1,0 +1,39 @@
+[
+    {
+        "label": "dotnet run",
+        "command": "dotnet",
+        "args": [
+            "run"
+        ],
+        "tags": [
+            "csharp-console-main",
+            "csharp-async-main"
+        ]
+    },
+    {
+        "label": "dotnet test $ZED_STEM",
+        "command": "dotnet",
+        "args": [
+            "test",
+            "$ZED_DIRNAME",
+            "--filter",
+            ".$ZED_SYMBOL"
+        ],
+        "tags": [
+            "csharp-test-method"
+        ]
+    },
+    {
+        "label": "dotnet build",
+        "command": "dotnet",
+        "args": [
+            "build",
+            "$ZED_DIRNAME"
+        ],
+        "tags": [
+            "csharp-console-main",
+            "csharp-async-main",
+            "csharp-test-method"
+        ]
+    }
+]
