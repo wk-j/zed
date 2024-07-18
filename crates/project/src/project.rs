@@ -29,7 +29,7 @@ use futures::{
     future::{join_all, try_join_all, Shared},
     select,
     stream::FuturesUnordered,
-    AsyncWriteExt, Future, FutureExt, StreamExt, TryFutureExt,
+    AsyncWriteExt, Future, FutureExt, StreamExt,
 };
 use fuzzy::CharBag;
 use git::{blame::Blame, repository::GitRepository};
@@ -43,6 +43,7 @@ use itertools::Itertools;
 use language::{
     language_settings::{
         language_settings, AllLanguageSettings, FormatOnSave, Formatter, InlayHintKind,
+        LanguageSettings,
     },
     markdown, point_to_lsp, prepare_completion_documentation,
     proto::{
@@ -60,7 +61,7 @@ use lsp::{
     CompletionContext, DiagnosticSeverity, DiagnosticTag, DidChangeWatchedFilesRegistrationOptions,
     DocumentHighlightKind, Edit, FileSystemWatcher, InsertTextFormat, LanguageServer,
     LanguageServerBinary, LanguageServerId, LspRequestFuture, MessageActionItem, OneOf,
-    ServerCapabilities, ServerHealthStatus, ServerStatus, TextEdit, WorkDoneProgressCancelParams,
+    ServerHealthStatus, ServerStatus, TextEdit, WorkDoneProgressCancelParams,
 };
 use lsp_command::*;
 use node_runtime::NodeRuntime;
@@ -86,13 +87,13 @@ use snippet::Snippet;
 use snippet_provider::SnippetProvider;
 use std::{
     borrow::Cow,
+    cell::RefCell,
     cmp::{self, Ordering},
     convert::TryInto,
     env,
     ffi::OsStr,
     hash::Hash,
     iter, mem,
-    num::NonZeroU32,
     ops::Range,
     path::{self, Component, Path, PathBuf},
     process::Stdio,
@@ -202,7 +203,7 @@ pub struct Project {
     _subscriptions: Vec<gpui::Subscription>,
     shared_buffers: HashMap<proto::PeerId, HashSet<BufferId>>,
     #[allow(clippy::type_complexity)]
-    loading_local_worktrees:
+    loading_worktrees:
         HashMap<Arc<Path>, Shared<Task<Result<Model<Worktree>, Arc<anyhow::Error>>>>>,
     buffer_snapshots: HashMap<BufferId, HashMap<LanguageServerId, Vec<LspBufferSnapshot>>>, // buffer_id -> server_id -> vec of snapshots
     buffers_being_formatted: HashSet<BufferId>,
@@ -602,6 +603,52 @@ impl FormatTrigger {
     }
 }
 
+#[derive(Clone)]
+pub enum DirectoryLister {
+    Project(Model<Project>),
+    Local(Arc<dyn Fs>),
+}
+
+impl DirectoryLister {
+    pub fn is_local(&self, cx: &AppContext) -> bool {
+        match self {
+            DirectoryLister::Local(_) => true,
+            DirectoryLister::Project(project) => project.read(cx).is_local(),
+        }
+    }
+
+    pub fn default_query(&self, cx: &mut AppContext) -> String {
+        if let DirectoryLister::Project(project) = self {
+            if let Some(worktree) = project.read(cx).visible_worktrees(cx).next() {
+                return worktree.read(cx).abs_path().to_string_lossy().to_string();
+            }
+        };
+        "~/".to_string()
+    }
+    pub fn list_directory(&self, query: String, cx: &mut AppContext) -> Task<Result<Vec<PathBuf>>> {
+        match self {
+            DirectoryLister::Project(project) => {
+                project.update(cx, |project, cx| project.list_directory(query, cx))
+            }
+            DirectoryLister::Local(fs) => {
+                let fs = fs.clone();
+                cx.background_executor().spawn(async move {
+                    let mut results = vec![];
+                    let expanded = shellexpand::tilde(&query);
+                    let query = Path::new(expanded.as_ref());
+                    let mut response = fs.read_dir(query).await?;
+                    while let Some(path) = response.next().await {
+                        if let Some(file_name) = path?.file_name() {
+                            results.push(PathBuf::from(file_name.to_os_string()));
+                        }
+                    }
+                    Ok(results)
+                })
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum SearchMatchCandidate {
     OpenBuffer {
@@ -727,7 +774,7 @@ impl Project {
                 collaborators: Default::default(),
                 buffer_store,
                 shared_buffers: Default::default(),
-                loading_local_worktrees: Default::default(),
+                loading_worktrees: Default::default(),
                 buffer_snapshots: Default::default(),
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
@@ -866,7 +913,7 @@ impl Project {
                 buffer_ordered_messages_tx: tx,
                 buffer_store,
                 shared_buffers: Default::default(),
-                loading_local_worktrees: Default::default(),
+                loading_worktrees: Default::default(),
                 active_entry: None,
                 collaborators: Default::default(),
                 join_project_response_message_id: response.message_id,
@@ -1068,7 +1115,7 @@ impl Project {
         for path in root_paths {
             let (tree, _) = project
                 .update(cx, |project, cx| {
-                    project.find_or_create_local_worktree(path, true, cx)
+                    project.find_or_create_worktree(path, true, cx)
                 })
                 .unwrap()
                 .await
@@ -1106,7 +1153,7 @@ impl Project {
         for path in root_paths {
             let (tree, _) = project
                 .update(cx, |project, cx| {
-                    project.find_or_create_local_worktree(path, true, cx)
+                    project.find_or_create_worktree(path, true, cx)
                 })
                 .await
                 .unwrap();
@@ -1909,7 +1956,7 @@ impl Project {
         abs_path: impl AsRef<Path>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Model<Buffer>>> {
-        if let Some((worktree, relative_path)) = self.find_local_worktree(abs_path.as_ref(), cx) {
+        if let Some((worktree, relative_path)) = self.find_worktree(abs_path.as_ref(), cx) {
             self.open_buffer((worktree.read(cx).id(), relative_path), cx)
         } else {
             Task::ready(Err(anyhow!("no such path")))
@@ -1976,7 +2023,7 @@ impl Project {
                 };
             let (worktree, relative_path) = if let Some(result) = this
                 .update(&mut cx, |this, cx| {
-                    this.find_local_worktree(&worktree_root_target, cx)
+                    this.find_worktree(&worktree_root_target, cx)
                 })? {
                 let relative_path =
                     known_relative_path.unwrap_or_else(|| Arc::<Path>::from(result.1));
@@ -1984,7 +2031,7 @@ impl Project {
             } else {
                 let worktree = this
                     .update(&mut cx, |this, cx| {
-                        this.create_local_worktree(&worktree_root_target, false, cx)
+                        this.create_worktree(&worktree_root_target, false, cx)
                     })?
                     .await?;
                 this.update(&mut cx, |this, cx| {
@@ -2547,15 +2594,21 @@ impl Project {
                 };
 
                 for (_, _, server) in self.language_servers_for_worktree(worktree_id) {
-                    let text = include_text(server.as_ref()).then(|| buffer.read(cx).text());
-                    server
-                        .notify::<lsp::notification::DidSaveTextDocument>(
-                            lsp::DidSaveTextDocumentParams {
-                                text_document: text_document.clone(),
-                                text,
-                            },
-                        )
-                        .log_err();
+                    if let Some(include_text) = include_text(server.as_ref()) {
+                        let text = if include_text {
+                            Some(buffer.read(cx).text())
+                        } else {
+                            None
+                        };
+                        server
+                            .notify::<lsp::notification::DidSaveTextDocument>(
+                                lsp::DidSaveTextDocumentParams {
+                                    text_document: text_document.clone(),
+                                    text,
+                                },
+                            )
+                            .log_err();
+                    }
                 }
 
                 for language_server_id in self.language_server_ids_for_buffer(buffer.read(cx), cx) {
@@ -3168,7 +3221,7 @@ impl Project {
     }
 
     async fn setup_pending_language_server(
-        this: WeakModel<Self>,
+        project: WeakModel<Self>,
         override_options: Option<serde_json::Value>,
         pending_server: PendingLanguageServer,
         delegate: Arc<dyn LspAdapterDelegate>,
@@ -3187,7 +3240,7 @@ impl Project {
         language_server
             .on_notification::<lsp::notification::PublishDiagnostics, _>({
                 let adapter = adapter.clone();
-                let this = this.clone();
+                let this = project.clone();
                 move |mut params, mut cx| {
                     let adapter = adapter.clone();
                     if let Some(this) = this.upgrade() {
@@ -3241,7 +3294,7 @@ impl Project {
         // to these requests when initializing.
         language_server
             .on_request::<lsp::request::WorkDoneProgressCreate, _, _>({
-                let this = this.clone();
+                let this = project.clone();
                 move |params, mut cx| {
                     let this = this.clone();
                     async move {
@@ -3262,20 +3315,103 @@ impl Project {
 
         language_server
             .on_request::<lsp::request::RegisterCapability, _, _>({
-                let this = this.clone();
+                let project = project.clone();
                 move |params, mut cx| {
-                    let this = this.clone();
+                    let project = project.clone();
                     async move {
                         for reg in params.registrations {
-                            if reg.method == "workspace/didChangeWatchedFiles" {
-                                if let Some(options) = reg.register_options {
-                                    let options = serde_json::from_value(options)?;
-                                    this.update(&mut cx, |this, cx| {
-                                        this.on_lsp_did_change_watched_files(
-                                            server_id, &reg.id, options, cx,
-                                        );
-                                    })?;
+                            match reg.method.as_str() {
+                                "workspace/didChangeWatchedFiles" => {
+                                    if let Some(options) = reg.register_options {
+                                        let options = serde_json::from_value(options)?;
+                                        project.update(&mut cx, |project, cx| {
+                                            project.on_lsp_did_change_watched_files(
+                                                server_id, &reg.id, options, cx,
+                                            );
+                                        })?;
+                                    }
                                 }
+                                "textDocument/rangeFormatting" => {
+                                    project.update(&mut cx, |project, _| {
+                                        if let Some(server) =
+                                            project.language_server_for_id(server_id)
+                                        {
+                                            let options = reg
+                                                .register_options
+                                                .map(|options| {
+                                                    serde_json::from_value::<
+                                                        lsp::DocumentRangeFormattingOptions,
+                                                    >(
+                                                        options
+                                                    )
+                                                })
+                                                .transpose()?;
+                                            let provider = match options {
+                                                None => OneOf::Left(true),
+                                                Some(options) => OneOf::Right(options),
+                                            };
+                                            server.update_capabilities(|capabilities| {
+                                                capabilities.document_range_formatting_provider =
+                                                    Some(provider);
+                                            })
+                                        }
+                                        anyhow::Ok(())
+                                    })??;
+                                }
+                                "textDocument/onTypeFormatting" => {
+                                    project.update(&mut cx, |project, _| {
+                                        if let Some(server) =
+                                            project.language_server_for_id(server_id)
+                                        {
+                                            let options = reg
+                                                .register_options
+                                                .map(|options| {
+                                                    serde_json::from_value::<
+                                                        lsp::DocumentOnTypeFormattingOptions,
+                                                    >(
+                                                        options
+                                                    )
+                                                })
+                                                .transpose()?;
+                                            if let Some(options) = options {
+                                                server.update_capabilities(|capabilities| {
+                                                    capabilities
+                                                        .document_on_type_formatting_provider =
+                                                        Some(options);
+                                                })
+                                            }
+                                        }
+                                        anyhow::Ok(())
+                                    })??;
+                                }
+                                "textDocument/formatting" => {
+                                    project.update(&mut cx, |project, _| {
+                                        if let Some(server) =
+                                            project.language_server_for_id(server_id)
+                                        {
+                                            let options = reg
+                                                .register_options
+                                                .map(|options| {
+                                                    serde_json::from_value::<
+                                                        lsp::DocumentFormattingOptions,
+                                                    >(
+                                                        options
+                                                    )
+                                                })
+                                                .transpose()?;
+                                            let provider = match options {
+                                                None => OneOf::Left(true),
+                                                Some(options) => OneOf::Right(options),
+                                            };
+                                            server.update_capabilities(|capabilities| {
+                                                capabilities.document_formatting_provider =
+                                                    Some(provider);
+                                            })
+                                        }
+                                        anyhow::Ok(())
+                                    })??;
+                                }
+                                _ => log::warn!("unhandled capability registration: {reg:?}"),
                             }
                         }
                         Ok(())
@@ -3286,17 +3422,55 @@ impl Project {
 
         language_server
             .on_request::<lsp::request::UnregisterCapability, _, _>({
-                let this = this.clone();
+                let this = project.clone();
                 move |params, mut cx| {
-                    let this = this.clone();
+                    let project = this.clone();
                     async move {
                         for unreg in params.unregisterations.iter() {
-                            if unreg.method == "workspace/didChangeWatchedFiles" {
-                                this.update(&mut cx, |this, cx| {
-                                    this.on_lsp_unregister_did_change_watched_files(
-                                        server_id, &unreg.id, cx,
-                                    );
-                                })?;
+                            match unreg.method.as_str() {
+                                "workspace/didChangeWatchedFiles" => {
+                                    project.update(&mut cx, |project, cx| {
+                                        project.on_lsp_unregister_did_change_watched_files(
+                                            server_id, &unreg.id, cx,
+                                        );
+                                    })?;
+                                }
+                                "textDocument/rangeFormatting" => {
+                                    project.update(&mut cx, |project, _| {
+                                        if let Some(server) =
+                                            project.language_server_for_id(server_id)
+                                        {
+                                            server.update_capabilities(|capabilities| {
+                                                capabilities.document_range_formatting_provider =
+                                                    None
+                                            })
+                                        }
+                                    })?;
+                                }
+                                "textDocument/onTypeFormatting" => {
+                                    project.update(&mut cx, |project, _| {
+                                        if let Some(server) =
+                                            project.language_server_for_id(server_id)
+                                        {
+                                            server.update_capabilities(|capabilities| {
+                                                capabilities.document_on_type_formatting_provider =
+                                                    None;
+                                            })
+                                        }
+                                    })?;
+                                }
+                                "textDocument/formatting" => {
+                                    project.update(&mut cx, |project, _| {
+                                        if let Some(server) =
+                                            project.language_server_for_id(server_id)
+                                        {
+                                            server.update_capabilities(|capabilities| {
+                                                capabilities.document_formatting_provider = None;
+                                            })
+                                        }
+                                    })?;
+                                }
+                                _ => log::warn!("unhandled capability unregistration: {unreg:?}"),
                             }
                         }
                         Ok(())
@@ -3308,7 +3482,7 @@ impl Project {
         language_server
             .on_request::<lsp::request::ApplyWorkspaceEdit, _, _>({
                 let adapter = adapter.clone();
-                let this = this.clone();
+                let this = project.clone();
                 move |params, cx| {
                     Self::on_lsp_workspace_edit(
                         this.clone(),
@@ -3323,7 +3497,7 @@ impl Project {
 
         language_server
             .on_request::<lsp::request::InlayHintRefreshRequest, _, _>({
-                let this = this.clone();
+                let this = project.clone();
                 move |(), mut cx| {
                     let this = this.clone();
                     async move {
@@ -3342,7 +3516,7 @@ impl Project {
 
         language_server
             .on_request::<lsp::request::ShowMessageRequest, _, _>({
-                let this = this.clone();
+                let this = project.clone();
                 let name = name.to_string();
                 move |params, mut cx| {
                     let this = this.clone();
@@ -3381,7 +3555,7 @@ impl Project {
 
         language_server
             .on_notification::<ServerStatus, _>({
-                let this = this.clone();
+                let this = project.clone();
                 let name = name.to_string();
                 move |params, mut cx| {
                     let this = this.clone();
@@ -3424,7 +3598,7 @@ impl Project {
             .detach();
         language_server
             .on_notification::<lsp::notification::ShowMessage, _>({
-                let this = this.clone();
+                let this = project.clone();
                 let name = name.to_string();
                 move |params, mut cx| {
                     let this = this.clone();
@@ -3451,7 +3625,7 @@ impl Project {
             .detach();
         language_server
             .on_notification::<lsp::notification::Progress, _>(move |params, mut cx| {
-                if let Some(this) = this.upgrade() {
+                if let Some(this) = project.upgrade() {
                     this.update(&mut cx, |this, cx| {
                         this.on_lsp_progress(
                             params,
@@ -4445,7 +4619,7 @@ impl Project {
         cx: &mut ModelContext<Project>,
     ) -> Result<(), anyhow::Error> {
         let (worktree, relative_path) = self
-            .find_local_worktree(&abs_path, cx)
+            .find_worktree(&abs_path, cx)
             .ok_or_else(|| anyhow!("no worktree found for diagnostics path {abs_path:?}"))?;
 
         let project_path = ProjectPath {
@@ -4793,7 +4967,6 @@ impl Project {
 
             let remove_trailing_whitespace = settings.remove_trailing_whitespace_on_save;
             let ensure_final_newline = settings.ensure_final_newline_on_save;
-            let tab_size = settings.tab_size;
 
             // First, format buffer's whitespace according to the settings.
             let trailing_whitespace_diff = if remove_trailing_whitespace {
@@ -4878,7 +5051,7 @@ impl Project {
                                 buffer,
                                 buffer_abs_path,
                                 language_server,
-                                tab_size,
+                                &settings,
                                 &mut cx,
                             )
                             .await
@@ -4927,7 +5100,7 @@ impl Project {
                                 buffer,
                                 buffer_abs_path,
                                 language_server,
-                                tab_size,
+                                &settings,
                                 &mut cx,
                             )
                             .await
@@ -4997,7 +5170,7 @@ impl Project {
         buffer: &Model<Buffer>,
         abs_path: &Path,
         language_server: &Arc<LanguageServer>,
-        tab_size: NonZeroU32,
+        settings: &LanguageSettings,
         cx: &mut AsyncAppContext,
     ) -> Result<Vec<(Range<Anchor>, String)>> {
         let uri = lsp::Url::from_file_path(abs_path)
@@ -5012,7 +5185,7 @@ impl Project {
             language_server
                 .request::<lsp::request::Formatting>(lsp::DocumentFormattingParams {
                     text_document,
-                    options: lsp_command::lsp_formatting_options(tab_size.get()),
+                    options: lsp_command::lsp_formatting_options(settings),
                     work_done_progress_params: Default::default(),
                 })
                 .await?
@@ -5024,7 +5197,7 @@ impl Project {
                 .request::<lsp::request::RangeFormatting>(lsp::DocumentRangeFormattingParams {
                     text_document,
                     range: lsp::Range::new(buffer_start, buffer_end),
-                    options: lsp_command::lsp_formatting_options(tab_size.get()),
+                    options: lsp_command::lsp_formatting_options(settings),
                     work_done_progress_params: Default::default(),
                 })
                 .await?
@@ -5313,9 +5486,7 @@ impl Project {
 
                                 let path;
                                 let worktree;
-                                if let Some((tree, rel_path)) =
-                                    this.find_local_worktree(&abs_path, cx)
-                                {
+                                if let Some((tree, rel_path)) = this.find_worktree(&abs_path, cx) {
                                     worktree = tree;
                                     path = rel_path;
                                 } else {
@@ -5450,7 +5621,6 @@ impl Project {
             let all_actions_task = self.request_multiple_lsp_locally(
                 buffer,
                 Some(position),
-                |server_capabilities| server_capabilities.signature_help_provider.is_some(),
                 GetSignatureHelp { position },
                 cx,
             );
@@ -5525,11 +5695,6 @@ impl Project {
             let all_actions_task = self.request_multiple_lsp_locally(
                 &buffer,
                 Some(position),
-                |server_capabilities| match server_capabilities.hover_provider {
-                    Some(lsp::HoverProviderCapability::Simple(enabled)) => enabled,
-                    Some(lsp::HoverProviderCapability::Options(_)) => true,
-                    None => false,
-                },
                 GetHover { position },
                 cx,
             );
@@ -6115,7 +6280,6 @@ impl Project {
             let all_actions_task = self.request_multiple_lsp_locally(
                 &buffer_handle,
                 Some(range.start),
-                GetCodeActions::supports_code_actions,
                 GetCodeActions {
                     range: range.clone(),
                     kinds: None,
@@ -6657,8 +6821,12 @@ impl Project {
         push_to_history: bool,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Option<Transaction>>> {
-        let tab_size = buffer.update(cx, |buffer, cx| {
-            language_settings(buffer.language_at(position).as_ref(), buffer.file(), cx).tab_size
+        let options = buffer.update(cx, |buffer, cx| {
+            lsp_command::lsp_formatting_options(language_settings(
+                buffer.language_at(position).as_ref(),
+                buffer.file(),
+                cx,
+            ))
         });
         self.request_lsp(
             buffer.clone(),
@@ -6666,7 +6834,7 @@ impl Project {
             OnTypeFormatting {
                 position,
                 trigger,
-                options: lsp_command::lsp_formatting_options(tab_size.get()).into(),
+                options,
                 push_to_history,
             },
             cx,
@@ -6768,7 +6936,7 @@ impl Project {
             } else {
                 return Task::ready(Ok(hint));
             };
-            if !InlayHints::can_resolve_inlays(lang_server.capabilities()) {
+            if !InlayHints::can_resolve_inlays(&lang_server.capabilities()) {
                 return Task::ready(Ok(hint));
             }
 
@@ -7180,7 +7348,7 @@ impl Project {
                 let lsp_params = request.to_lsp(&file.abs_path(cx), buffer, &language_server, cx);
                 let status = request.status();
                 return cx.spawn(move |this, cx| async move {
-                    if !request.check_capabilities(language_server.capabilities()) {
+                    if !request.check_capabilities(language_server.adapter_server_capabilities()) {
                         return Ok(Default::default());
                     }
 
@@ -7256,7 +7424,6 @@ impl Project {
         &self,
         buffer: &Model<Buffer>,
         position: Option<P>,
-        server_capabilities_check: fn(&ServerCapabilities) -> bool,
         request: R,
         cx: &mut ModelContext<'_, Self>,
     ) -> Task<Vec<R::Response>>
@@ -7274,7 +7441,6 @@ impl Project {
         let scope = position.and_then(|position| snapshot.language_scope_at(position));
         let mut response_results = self
             .language_servers_for_buffer(buffer.read(cx), cx)
-            .filter(|(_, server)| server_capabilities_check(server.capabilities()))
             .filter(|(adapter, _)| {
                 scope
                     .as_ref()
@@ -7389,23 +7555,23 @@ impl Project {
         Ok(())
     }
 
-    pub fn find_or_create_local_worktree(
+    pub fn find_or_create_worktree(
         &mut self,
         abs_path: impl AsRef<Path>,
         visible: bool,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<(Model<Worktree>, PathBuf)>> {
         let abs_path = abs_path.as_ref();
-        if let Some((tree, relative_path)) = self.find_local_worktree(abs_path, cx) {
+        if let Some((tree, relative_path)) = self.find_worktree(abs_path, cx) {
             Task::ready(Ok((tree, relative_path)))
         } else {
-            let worktree = self.create_local_worktree(abs_path, visible, cx);
+            let worktree = self.create_worktree(abs_path, visible, cx);
             cx.background_executor()
                 .spawn(async move { Ok((worktree.await?, PathBuf::new())) })
         }
     }
 
-    pub fn find_local_worktree(
+    pub fn find_worktree(
         &self,
         abs_path: &Path,
         cx: &AppContext,
@@ -7432,56 +7598,160 @@ impl Project {
         }
     }
 
-    fn create_local_worktree(
+    pub fn list_directory(
+        &self,
+        query: String,
+        cx: &mut ModelContext<Self>,
+    ) -> Task<Result<Vec<PathBuf>>> {
+        if self.is_local() {
+            DirectoryLister::Local(self.fs.clone()).list_directory(query, cx)
+        } else if let Some(dev_server) = self.dev_server_project_id().and_then(|id| {
+            dev_server_projects::Store::global(cx)
+                .read(cx)
+                .dev_server_for_project(id)
+        }) {
+            let request = proto::ListRemoteDirectory {
+                dev_server_id: dev_server.id.0,
+                path: query,
+            };
+            let response = self.client.request(request);
+            cx.background_executor().spawn(async move {
+                let response = response.await?;
+                Ok(response.entries.into_iter().map(PathBuf::from).collect())
+            })
+        } else {
+            Task::ready(Err(anyhow!("cannot list directory in remote project")))
+        }
+    }
+
+    fn create_worktree(
         &mut self,
         abs_path: impl AsRef<Path>,
         visible: bool,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Model<Worktree>>> {
+        let path: Arc<Path> = abs_path.as_ref().into();
+        if !self.loading_worktrees.contains_key(&path) {
+            let task = if self.is_local() {
+                self.create_local_worktree(abs_path, visible, cx)
+            } else if self.dev_server_project_id.is_some() {
+                self.create_dev_server_worktree(abs_path, cx)
+            } else {
+                return Task::ready(Err(anyhow!("not a local project")));
+            };
+            self.loading_worktrees.insert(path.clone(), task.shared());
+        }
+        let task = self.loading_worktrees.get(&path).unwrap().clone();
+        cx.background_executor().spawn(async move {
+            let result = match task.await {
+                Ok(worktree) => Ok(worktree),
+                Err(err) => Err(anyhow!("{}", err)),
+            };
+            result
+        })
+    }
+
+    fn create_local_worktree(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        visible: bool,
+        cx: &mut ModelContext<Self>,
+    ) -> Task<Result<Model<Worktree>, Arc<anyhow::Error>>> {
         let fs = self.fs.clone();
         let next_entry_id = self.next_entry_id.clone();
         let path: Arc<Path> = abs_path.as_ref().into();
-        let task = self
-            .loading_local_worktrees
-            .entry(path.clone())
-            .or_insert_with(|| {
-                cx.spawn(move |project, mut cx| {
-                    async move {
-                        let worktree =
-                            Worktree::local(path.clone(), visible, fs, next_entry_id, &mut cx)
-                                .await;
 
-                        project.update(&mut cx, |project, _| {
-                            project.loading_local_worktrees.remove(&path);
-                        })?;
+        cx.spawn(move |project, mut cx| async move {
+            let worktree = Worktree::local(path.clone(), visible, fs, next_entry_id, &mut cx).await;
 
-                        let worktree = worktree?;
-                        project
-                            .update(&mut cx, |project, cx| project.add_worktree(&worktree, cx))?;
+            project.update(&mut cx, |project, _| {
+                project.loading_worktrees.remove(&path);
+            })?;
 
-                        if visible {
-                            cx.update(|cx| {
-                                cx.add_recent_document(&path);
-                            })
-                            .log_err();
-                        }
+            let worktree = worktree?;
+            project.update(&mut cx, |project, cx| project.add_worktree(&worktree, cx))?;
 
-                        Ok(worktree)
-                    }
-                    .map_err(Arc::new)
+            if visible {
+                cx.update(|cx| {
+                    cx.add_recent_document(&path);
                 })
-                .shared()
-            })
-            .clone();
-        cx.background_executor().spawn(async move {
-            match task.await {
-                Ok(worktree) => Ok(worktree),
-                Err(err) => Err(anyhow!("{}", err)),
+                .log_err();
             }
+
+            Ok(worktree)
+        })
+    }
+
+    fn create_dev_server_worktree(
+        &mut self,
+        abs_path: impl AsRef<Path>,
+        cx: &mut ModelContext<Self>,
+    ) -> Task<Result<Model<Worktree>, Arc<anyhow::Error>>> {
+        let client = self.client.clone();
+        let path: Arc<Path> = abs_path.as_ref().into();
+        let mut paths: Vec<String> = self
+            .visible_worktrees(cx)
+            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().to_string())
+            .collect();
+        paths.push(path.to_string_lossy().to_string());
+        let request = client.request(proto::UpdateDevServerProject {
+            dev_server_project_id: self.dev_server_project_id.unwrap().0,
+            paths,
+        });
+
+        let abs_path = abs_path.as_ref().to_path_buf();
+        cx.spawn(move |project, mut cx| async move {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let tx = RefCell::new(Some(tx));
+            let Some(project) = project.upgrade() else {
+                return Err(anyhow!("project dropped"))?;
+            };
+            let observer = cx.update(|cx| {
+                cx.observe(&project, move |project, cx| {
+                    let abs_path = abs_path.clone();
+                    project.update(cx, |project, cx| {
+                        if let Some((worktree, _)) = project.find_worktree(&abs_path, cx) {
+                            if let Some(tx) = tx.borrow_mut().take() {
+                                tx.send(worktree).ok();
+                            }
+                        }
+                    })
+                })
+            })?;
+
+            request.await?;
+            let worktree = rx.await.map_err(|e| anyhow!(e))?;
+            drop(observer);
+            project.update(&mut cx, |project, _| {
+                project.loading_worktrees.remove(&path);
+            })?;
+            Ok(worktree)
         })
     }
 
     pub fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut ModelContext<Self>) {
+        if let Some(dev_server_project_id) = self.dev_server_project_id {
+            let paths: Vec<String> = self
+                .visible_worktrees(cx)
+                .filter_map(|worktree| {
+                    if worktree.read(cx).id() == id_to_remove {
+                        None
+                    } else {
+                        Some(worktree.read(cx).abs_path().to_string_lossy().to_string())
+                    }
+                })
+                .collect();
+            if paths.len() > 0 {
+                let request = self.client.request(proto::UpdateDevServerProject {
+                    dev_server_project_id: dev_server_project_id.0,
+                    paths,
+                });
+                cx.background_executor()
+                    .spawn(request)
+                    .detach_and_log_err(cx);
+            }
+            return;
+        }
         self.diagnostics.remove(&id_to_remove);
         self.diagnostic_summaries.remove(&id_to_remove);
 
@@ -8133,18 +8403,6 @@ impl Project {
         })
     }
 
-    pub fn project_path_for_absolute_path(
-        &self,
-        abs_path: &Path,
-        cx: &AppContext,
-    ) -> Option<ProjectPath> {
-        self.find_local_worktree(abs_path, cx)
-            .map(|(worktree, relative_path)| ProjectPath {
-                worktree_id: worktree.read(cx).id(),
-                path: relative_path.into(),
-            })
-    }
-
     pub fn get_workspace_root(
         &self,
         project_path: &ProjectPath,
@@ -8308,11 +8566,6 @@ impl Project {
                         project.request_multiple_lsp_locally(
                             &buffer,
                             Some(get_hover.position),
-                            |server_capabilities| match server_capabilities.hover_provider {
-                                Some(lsp::HoverProviderCapability::Simple(enabled)) => enabled,
-                                Some(lsp::HoverProviderCapability::Options(_)) => true,
-                                None => false,
-                            },
                             get_hover,
                             cx,
                         )
@@ -8350,7 +8603,6 @@ impl Project {
                         project.request_multiple_lsp_locally(
                             &buffer,
                             Some(get_code_actions.range.start),
-                            GetCodeActions::supports_code_actions,
                             get_code_actions,
                             cx,
                         )
@@ -8388,9 +8640,6 @@ impl Project {
                         project.request_multiple_lsp_locally(
                             &buffer,
                             Some(get_signature_help.position),
-                            |server_capabilities| {
-                                server_capabilities.signature_help_provider.is_some()
-                            },
                             get_signature_help,
                             cx,
                         )
@@ -11179,20 +11428,27 @@ impl Completion {
     }
 }
 
-fn include_text(server: &lsp::LanguageServer) -> bool {
-    server
-        .capabilities()
-        .text_document_sync
-        .as_ref()
-        .and_then(|sync| match sync {
-            lsp::TextDocumentSyncCapability::Kind(_) => None,
-            lsp::TextDocumentSyncCapability::Options(options) => options.save.as_ref(),
-        })
-        .and_then(|save_options| match save_options {
-            lsp::TextDocumentSyncSaveOptions::Supported(_) => None,
-            lsp::TextDocumentSyncSaveOptions::SaveOptions(options) => options.include_text,
-        })
-        .unwrap_or(false)
+fn include_text(server: &lsp::LanguageServer) -> Option<bool> {
+    match server.capabilities().text_document_sync.as_ref()? {
+        lsp::TextDocumentSyncCapability::Kind(kind) => match kind {
+            &lsp::TextDocumentSyncKind::NONE => None,
+            &lsp::TextDocumentSyncKind::FULL => Some(true),
+            &lsp::TextDocumentSyncKind::INCREMENTAL => Some(false),
+            _ => None,
+        },
+        lsp::TextDocumentSyncCapability::Options(options) => match options.save.as_ref()? {
+            lsp::TextDocumentSyncSaveOptions::Supported(supported) => {
+                if *supported {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            lsp::TextDocumentSyncSaveOptions::SaveOptions(save_options) => {
+                Some(save_options.include_text.unwrap_or(false))
+            }
+        },
+    }
 }
 
 async fn load_direnv_environment(dir: &Path) -> Result<Option<HashMap<String, String>>> {
@@ -11586,7 +11842,7 @@ fn sort_search_matches(search_matches: &mut Vec<SearchMatchCandidate>, cx: &AppC
     });
 }
 
-fn compare_paths(
+pub fn compare_paths(
     (path_a, a_is_file): (&Path, bool),
     (path_b, b_is_file): (&Path, bool),
 ) -> cmp::Ordering {
