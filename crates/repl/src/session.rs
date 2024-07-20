@@ -5,8 +5,9 @@ use crate::{
 use collections::{HashMap, HashSet};
 use editor::{
     display_map::{
-        BlockContext, BlockDisposition, BlockId, BlockProperties, BlockStyle, RenderBlock,
+        BlockContext, BlockDisposition, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
     },
+    scroll::Autoscroll,
     Anchor, AnchorRangeExt as _, Editor, MultiBuffer, ToPoint,
 };
 use futures::{FutureExt as _, StreamExt as _};
@@ -36,7 +37,7 @@ struct EditorBlock {
     editor: WeakView<Editor>,
     code_range: Range<Anchor>,
     invalidation_anchor: Anchor,
-    block_id: BlockId,
+    block_id: CustomBlockId,
     execution_view: View<ExecutionView>,
 }
 
@@ -176,10 +177,61 @@ impl Session {
                 let kernel = kernel.await;
 
                 match kernel {
-                    Ok((kernel, mut messages_rx)) => {
+                    Ok((mut kernel, mut messages_rx)) => {
                         this.update(&mut cx, |this, cx| {
                             // At this point we can create a new kind of kernel that has the process and our long running background tasks
+
+                            let status = kernel.process.status();
                             this.kernel = Kernel::RunningKernel(kernel);
+
+                            cx.spawn(|session, mut cx| async move {
+                                let error_message = match status.await {
+                                    Ok(status) => {
+                                        if status.success() {
+                                            log::info!("kernel process exited successfully");
+                                            return;
+                                        }
+
+                                        format!("kernel process exited with status: {:?}", status)
+                                    }
+                                    Err(err) => {
+                                        format!("kernel process exited with error: {:?}", err)
+                                    }
+                                };
+
+                                log::error!("{}", error_message);
+
+                                session
+                                    .update(&mut cx, |session, cx| {
+                                        session.kernel =
+                                            Kernel::ErroredLaunch(error_message.clone());
+
+                                        session.blocks.values().for_each(|block| {
+                                            block.execution_view.update(
+                                                cx,
+                                                |execution_view, cx| {
+                                                    match execution_view.status {
+                                                        ExecutionStatus::Finished => {
+                                                            // Do nothing when the output was good
+                                                        }
+                                                        _ => {
+                                                            // All other cases, set the status to errored
+                                                            execution_view.status =
+                                                                ExecutionStatus::KernelErrored(
+                                                                    error_message.clone(),
+                                                                )
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            );
+                                        });
+
+                                        cx.notify();
+                                    })
+                                    .ok();
+                            })
+                            .detach();
 
                             this.messaging_task = cx.spawn(|session, mut cx| async move {
                                 while let Some(message) = messages_rx.next().await {
@@ -230,7 +282,7 @@ impl Session {
         if let multi_buffer::Event::Edited { .. } = event {
             let snapshot = buffer.read(cx).snapshot(cx);
 
-            let mut blocks_to_remove: HashSet<BlockId> = HashSet::default();
+            let mut blocks_to_remove: HashSet<CustomBlockId> = HashSet::default();
 
             self.blocks.retain(|_id, block| {
                 if block.invalidation_anchor.is_valid(&snapshot) {
@@ -264,7 +316,7 @@ impl Session {
     }
 
     pub fn clear_outputs(&mut self, cx: &mut ViewContext<Self>) {
-        let blocks_to_remove: HashSet<BlockId> =
+        let blocks_to_remove: HashSet<CustomBlockId> =
             self.blocks.values().map(|block| block.block_id).collect();
 
         self.editor
@@ -294,7 +346,7 @@ impl Session {
 
         let message: JupyterMessage = execute_request.into();
 
-        let mut blocks_to_remove: HashSet<BlockId> = HashSet::default();
+        let mut blocks_to_remove: HashSet<CustomBlockId> = HashSet::default();
 
         let buffer = editor.read(cx).buffer().read(cx).snapshot(cx);
 
@@ -329,6 +381,8 @@ impl Session {
             return;
         };
 
+        let new_cursor_pos = editor_block.invalidation_anchor;
+
         self.blocks
             .insert(message.header.msg_id.clone(), editor_block);
 
@@ -352,6 +406,13 @@ impl Session {
             }
             _ => {}
         }
+
+        // Now move the cursor to after the block
+        editor.update(cx, move |editor, cx| {
+            editor.change_selections(Some(Autoscroll::top_relative(8)), cx, |selections| {
+                selections.select_ranges([new_cursor_pos..new_cursor_pos]);
+            });
+        });
     }
 
     fn route(&mut self, message: &JupyterMessage, cx: &mut ViewContext<Self>) {
